@@ -111,6 +111,8 @@ const DEFAULT_SNAPSHOT_MAX_DEPTH: u32 = 32;
 const HARD_SNAPSHOT_MAX_DEPTH: u32 = 64;
 const CHILD_READ_CONCURRENCY: usize = 16;
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_ACTIONS_PER_OBJECT: i32 = 64;
+const ACTION_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DISCOVERY_ROOTS: usize = 256;
 const ROOT_MATCH_CHILD_LIMIT: usize = 8;
 const MAX_DISCOVERY_CHILD_READS: usize = MAX_DISCOVERY_ROOTS * ROOT_MATCH_CHILD_LIMIT;
@@ -600,26 +602,32 @@ async fn perform_action_inner(
     requested_action: Option<&str>,
     name_only: bool,
 ) -> Result<ActionInvocation> {
-    let conn = connect().await?;
     let object_ref = object_ref_from_id(object_ref_id)?;
-    let proxy = open_accessible(&conn, &object_ref)
-        .await
-        .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
-    let action = proxy
-        .proxies()
-        .await?
-        .action()
-        .await
-        .context("element does not expose the AT-SPI Action interface")?;
-    let actions = read_actions(&action).await;
-    let action_index = if name_only {
-        select_named_action_index(&actions, requested_action.unwrap_or_default())?
-    } else {
-        select_action_index(&actions, requested_action)?
-    };
-    let action_name = actions
-        .get(action_index as usize)
-        .map(|action| action.name.clone());
+    let (action, action_index, action_name) = timeout(ACTION_QUERY_TIMEOUT, async {
+        let conn = connect().await?;
+        let proxy = open_accessible(&conn, &object_ref)
+            .await
+            .with_context(|| format!("failed to open AT-SPI object {object_ref_id}"))?;
+        let action = proxy
+            .proxies()
+            .await?
+            .action()
+            .await
+            .context("element does not expose the AT-SPI Action interface")?;
+        let actions = read_actions(&action).await?;
+        let action_index = if name_only {
+            select_named_action_index(&actions, requested_action.unwrap_or_default())?
+        } else {
+            select_action_index(&actions, requested_action)?
+        };
+        let action_name = actions
+            .get(action_index as usize)
+            .map(|action| action.name.clone());
+        Ok::<_, anyhow::Error>((action, action_index, action_name))
+    })
+    .await
+    .context("AT-SPI action revalidation exceeded its 5-second deadline")??;
+    // Only time out the reads: once DoAction is sent, it may already have acted.
     let ok = action
         .do_action(action_index)
         .await
@@ -974,6 +982,7 @@ async fn actions_from_proxies(
 
     read_actions(&action_proxy)
         .await
+        .unwrap_or_default()
         .into_iter()
         .enumerate()
         .map(|(index, action)| AccessibilityAction {
@@ -985,32 +994,43 @@ async fn actions_from_proxies(
         .collect()
 }
 
-async fn read_actions(proxy: &ActionProxy<'_>) -> Vec<atspi::Action> {
+async fn read_actions(proxy: &ActionProxy<'_>) -> Result<Vec<atspi::Action>> {
     // WebKit can advertise GetActions without replying to it. The indexed
     // methods work, and must also be used when revalidating a cached action.
     // Keep the wire spelling: the current atspi binding asks for "Nactions".
-    let count = proxy
-        .inner()
-        .get_property::<i32>("NActions")
-        .await
-        .unwrap_or_default()
-        .max(0);
-    stream::iter(0..count)
-        .map(|index| async move {
-            let (name, description, keybinding) = tokio::join!(
-                proxy.get_localized_name(index),
-                proxy.get_description(index),
-                proxy.get_key_binding(index),
-            );
-            atspi::Action {
-                name: name.unwrap_or_default(),
-                description: description.unwrap_or_default(),
-                keybinding: keybinding.unwrap_or_default(),
-            }
-        })
-        .buffered(CHILD_READ_CONCURRENCY)
-        .collect()
-        .await
+    timeout(ACTION_QUERY_TIMEOUT, async {
+        let count = proxy
+            .inner()
+            .get_property::<i32>("NActions")
+            .await
+            .context("failed to read AT-SPI action count")?;
+        if count > MAX_ACTIONS_PER_OBJECT {
+            return Err(anyhow!(
+                "AT-SPI action count {count} exceeds the {MAX_ACTIONS_PER_OBJECT}-action read budget"
+            ));
+        }
+        if count < 0 {
+            return Err(anyhow!("invalid negative AT-SPI action count {count}"));
+        }
+        Ok(stream::iter(0..count)
+            .map(|index| async move {
+                let (name, description, keybinding) = tokio::join!(
+                    proxy.get_localized_name(index),
+                    proxy.get_description(index),
+                    proxy.get_key_binding(index),
+                );
+                atspi::Action {
+                    name: name.unwrap_or_default(),
+                    description: description.unwrap_or_default(),
+                    keybinding: keybinding.unwrap_or_default(),
+                }
+            })
+            .buffered(CHILD_READ_CONCURRENCY)
+            .collect()
+            .await)
+    })
+    .await
+    .context("AT-SPI action reads exceeded their 5-second deadline")?
 }
 
 async fn states_from_proxy(proxy: &AccessibleProxy<'_>) -> Vec<String> {
@@ -1168,6 +1188,40 @@ fn object_ref_id(object_ref: &ObjectRefOwned) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        process::{Child, Command, Stdio},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    struct PrivateBus(Child);
+
+    impl PrivateBus {
+        fn start() -> (Self, String) {
+            let mut bus = Self(
+                Command::new("dbus-daemon")
+                    .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut address = String::new();
+            BufReader::new(bus.0.stdout.take().unwrap())
+                .read_line(&mut address)
+                .unwrap();
+            (bus, address.trim().to_string())
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
 
     struct FakeAccessible {
         name: String,
@@ -1207,7 +1261,21 @@ mod tests {
         }
     }
 
-    struct FakeWebKitAction;
+    struct FakeWebKitAction {
+        count: i32,
+        stall_indexed_reads: bool,
+        name_reads: Arc<AtomicUsize>,
+    }
+
+    impl Default for FakeWebKitAction {
+        fn default() -> Self {
+            Self {
+                count: 1,
+                stall_indexed_reads: false,
+                name_reads: Arc::default(),
+            }
+        }
+    }
 
     #[zbus::interface(name = "org.a11y.atspi.Action")]
     impl FakeWebKitAction {
@@ -1217,26 +1285,30 @@ mod tests {
 
         #[zbus(property, name = "NActions")]
         fn nactions(&self) -> i32 {
-            1
+            self.count
         }
 
         fn get_name(&self, index: i32) -> &str {
-            assert_eq!(index, 0);
+            assert!((0..self.count).contains(&index));
             "click"
         }
 
-        fn get_localized_name(&self, index: i32) -> &str {
-            assert_eq!(index, 0);
+        async fn get_localized_name(&self, index: i32) -> &str {
+            assert!((0..self.count).contains(&index));
+            self.name_reads.fetch_add(1, Ordering::SeqCst);
+            if self.stall_indexed_reads {
+                std::future::pending::<()>().await;
+            }
             "Activate"
         }
 
         fn get_description(&self, index: i32) -> &str {
-            assert_eq!(index, 0);
+            assert!((0..self.count).contains(&index));
             "Activate the control"
         }
 
         fn get_key_binding(&self, index: i32) -> &str {
-            assert_eq!(index, 0);
+            assert!((0..self.count).contains(&index));
             "Return"
         }
 
@@ -1247,27 +1319,7 @@ mod tests {
 
     #[tokio::test]
     async fn indexed_children_resolve_webkit_names_on_the_accessibility_bus() {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
-
-        struct PrivateBus(std::process::Child);
-        impl Drop for PrivateBus {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let mut bus = PrivateBus(
-            Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
-                .stdout(Stdio::piped())
-                .spawn()
-                .unwrap(),
-        );
-        let mut address = String::new();
-        BufReader::new(bus.0.stdout.take().unwrap())
-            .read_line(&mut address)
-            .unwrap();
+        let (_bus, address) = PrivateBus::start();
 
         let webkit_name = "org.webkit.MockWebProcess";
         let child_path = "/org/a11y/webkit/accessible/child";
@@ -1284,7 +1336,7 @@ mod tests {
                 },
             )
             .unwrap()
-            .serve_at(child_path, FakeWebKitAction)
+            .serve_at(child_path, FakeWebKitAction::default())
             .unwrap()
             .build()
             .await
@@ -1353,13 +1405,116 @@ mod tests {
         let action = child.proxies().await.unwrap().action().await.unwrap();
         let actions = timeout(Duration::from_secs(1), read_actions(&action))
             .await
-            .expect("indexed action reads must not wait for GetActions");
+            .expect("indexed action reads must not wait for GetActions")
+            .unwrap();
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].name, "Activate");
         assert_eq!(actions[0].description, "Activate the control");
         assert_eq!(actions[0].keybinding, "Return");
         assert_eq!(select_named_action_index(&actions, "Activate").unwrap(), 0);
         assert!(action.do_action(0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn indexed_actions_bound_untrusted_counts_before_reading_indices() {
+        let (_bus, address) = PrivateBus::start();
+        let name_reads = Arc::new(AtomicUsize::new(0));
+        let counts = [
+            -1,
+            MAX_ACTIONS_PER_OBJECT + 1,
+            i32::MAX,
+            0,
+            MAX_ACTIONS_PER_OBJECT,
+        ];
+        let mut builder = zbus::connection::Builder::address(address.as_str()).unwrap();
+        for (index, count) in counts.iter().enumerate() {
+            builder = builder
+                .serve_at(
+                    format!("/actions/{index}"),
+                    FakeWebKitAction {
+                        count: *count,
+                        name_reads: Arc::clone(&name_reads),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        let peer = builder.build().await.unwrap();
+        let client = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        for (index, count) in counts.iter().enumerate() {
+            let action = ActionProxy::builder(&client)
+                .destination(peer.unique_name().unwrap().clone())
+                .unwrap()
+                .path(format!("/actions/{index}"))
+                .unwrap()
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .unwrap();
+            let result = timeout(Duration::from_secs(1), read_actions(&action))
+                .await
+                .expect("untrusted counts must not cause unbounded work");
+            if (0..=MAX_ACTIONS_PER_OBJECT).contains(count) {
+                assert_eq!(result.unwrap().len(), *count as usize);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("action count"), "{error}");
+                assert_eq!(name_reads.load(Ordering::SeqCst), 0);
+            }
+        }
+        assert_eq!(
+            name_reads.load(Ordering::SeqCst),
+            MAX_ACTIONS_PER_OBJECT as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn indexed_actions_time_out_the_entire_read() {
+        let (_bus, address) = PrivateBus::start();
+        let name_reads = Arc::new(AtomicUsize::new(0));
+        let peer = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .serve_at(
+                "/actions/stalled",
+                FakeWebKitAction {
+                    stall_indexed_reads: true,
+                    name_reads: Arc::clone(&name_reads),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let client = zbus::connection::Builder::address(address.as_str())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let action = ActionProxy::builder(&client)
+            .destination(peer.unique_name().unwrap().clone())
+            .unwrap()
+            .path("/actions/stalled")
+            .unwrap()
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .unwrap();
+
+        let error = timeout(
+            ACTION_QUERY_TIMEOUT + Duration::from_secs(1),
+            read_actions(&action),
+        )
+        .await
+        .expect("indexed reads must have an overall deadline")
+        .unwrap_err();
+        assert!(error.to_string().contains("5-second deadline"));
+        assert_eq!(name_reads.load(Ordering::SeqCst), 1);
     }
 
     #[test]
