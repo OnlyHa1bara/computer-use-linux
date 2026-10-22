@@ -64,7 +64,7 @@ app.whenReady().then(async () => {
         if (!mcp) await startMcp();
         response = await rpc('tools/call', {name:'type_text',arguments:{pid:process.pid,text:requested}});
         const payload = response.structuredContent || JSON.parse(response.content.find(c => c.type === 'text').text);
-        code = !response.isError && (secret ? payload.ok === false && payload.message.includes('password fields') : payload.ok === true) ? 0 : 1;
+        code = response.isError === secret && (secret ? payload.ok === false && payload.message.includes('password fields') : payload.ok === true) ? 0 : 1;
       } else {
         const args = mode === 'stdin' ? ['-'] : ['--', text];
         const child = spawn('wtype', args, { stdio: ['pipe', 'pipe', 'pipe'] });

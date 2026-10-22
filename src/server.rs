@@ -2968,7 +2968,9 @@ fn structured_tool_result<T: Serialize>(
     let value = serde_json::to_value(&output).map_err(|error| {
         ErrorData::internal_error(format!("failed to serialize tool output: {error}"), None)
     })?;
+    let is_error = value.get("ok").and_then(serde_json::Value::as_bool) == Some(false);
     let mut result = CallToolResult::structured(value);
+    result.is_error = Some(is_error);
     if let Some(capture) = screenshot {
         result.content.insert(
             0,
@@ -7802,6 +7804,7 @@ printf '%s %s\n' "${0##*/}" "$*" >> "$CUL_POINTER_TEST_LOG"
     #[test]
     fn app_state_result_without_screenshot_is_text_only() {
         let result = app_state_result(sample_app_state_output(None), None).unwrap();
+        assert_eq!(result.is_error, Some(false));
         assert_eq!(result.content.len(), 1);
         assert!(result.content[0].as_text().is_some());
         assert_eq!(
@@ -11074,6 +11077,7 @@ exit 1
         }))
         .unwrap();
         let result = server.click(Parameters(bad_click)).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
         let structured = result.structured_content.expect("structured content");
         assert_eq!(structured["ok"], serde_json::json!(false));
         assert!(structured.get("screenshot").is_none());

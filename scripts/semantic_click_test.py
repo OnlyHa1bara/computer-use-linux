@@ -15,7 +15,7 @@ import tempfile
 import time
 
 
-def rpc(proc, request):
+def rpc(proc, request, *, expect_error=False):
     proc.stdin.write(json.dumps(request) + '\n')
     proc.stdin.flush()
     if 'id' not in request:
@@ -31,7 +31,7 @@ def rpc(proc, request):
         if response.get('id') == request['id']:
             assert 'error' not in response, response
             result = response['result']
-            assert not result.get('isError'), result
+            assert result.get('isError', False) is expect_error, result
             return result
     raise TimeoutError('MCP response timeout')
 
@@ -115,11 +115,11 @@ Gtk.main()
                 else:
                     raise AssertionError('Button did not activate')
                 print(json.dumps({'scale':scale,'bounds':nodes[0]['bounds'],'activated':True,'message':result['message']}), flush=True)
-                blocked = payload(rpc(mcp, {'jsonrpc':'2.0','id':31,'method':'tools/call','params':{'name':'click','arguments':{'x':0,'y':0}}}))
+                blocked = payload(rpc(mcp, {'jsonrpc':'2.0','id':31,'method':'tools/call','params':{'name':'click','arguments':{'x':0,'y':0}}}, expect_error=True))
                 assert not blocked['ok'], 'physical pointer fallback was not disabled'
                 entries = [n for n in state['accessibility_tree'] if n.get('name') == 'ENTRY_TEST']
                 assert len(entries) == 1, state
-                entry_result = payload(rpc(mcp, {'jsonrpc':'2.0','id':32,'method':'tools/call','params':{'name':'click','arguments':{'element_index':entries[0]['index']}}}))
+                entry_result = payload(rpc(mcp, {'jsonrpc':'2.0','id':32,'method':'tools/call','params':{'name':'click','arguments':{'element_index':entries[0]['index']}}}, expect_error=True))
                 assert not entry_result['ok'], 'entry click bypassed the disabled pointer path'
                 time.sleep(.1)
                 evidence.seek(0)
