@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Report failed desktop actions and intentional refusals as MCP tool errors with `isError: true`, while preserving successful results when only post-action observation fails. Thanks @OnlyHa1bara. (#280)
 
+### Security
+
+- Update Tokio to 1.53.3 and register the GNOME indicator socket with the I/O-safe `AsyncFd::register` API, addressing RUSTSEC-2026-0386. (#280)
+
 ## [0.7.22] - 2026-10-20
 
 ### Fixed
