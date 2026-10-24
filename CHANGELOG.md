@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Report failed desktop actions and intentional refusals as MCP tool errors with `isError: true`, while preserving successful results when only post-action observation fails. Thanks @OnlyHa1bara. (#280)
+
 ## [0.7.22] - 2026-10-20
 
 ### Fixed
